@@ -20,6 +20,7 @@ class Settings(context: Context) {
     var direction by mutableStateOf(Direction.values()[p.getInt("direction", 0)])
     var rotationOverride by mutableStateOf(p.getInt("rotation", -1)) // -1 = from camera
     var linePos by mutableStateOf(p.getFloat("linePos", 0.5f))
+    var sharpnessPriority by mutableStateOf(p.getBoolean("sharp", false))
 
     // Start
     var startMode by mutableStateOf(StartMode.values()[p.getInt("startMode", 0)])
@@ -53,7 +54,7 @@ class Settings(context: Context) {
         p.edit()
             .putInt("fps", fps).putInt("shutter", shutter).putInt("sliceWidth", sliceWidth)
             .putInt("direction", direction.ordinal).putInt("rotation", rotationOverride)
-            .putFloat("linePos", linePos)
+            .putFloat("linePos", linePos).putBoolean("sharp", sharpnessPriority)
             .putInt("startMode", startMode.ordinal)
             .putFloat("offTouch", offsetTouch.toFloat()).putFloat("offGun", offsetGun.toFloat())
             .putFloat("offVoice", offsetVoice.toFloat())

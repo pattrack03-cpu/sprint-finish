@@ -93,7 +93,10 @@ class GlSlicer(private val listener: Listener) {
 
     @Volatile var linePos = 0.5f
     @Volatile var sliceWidth = 1
-    @Volatile var rotation = 90
+    /** Extra rotation on top of what Android already applies to the camera image (normally 0). */
+    @Volatile var rotation = 0
+    /** Camera sensor mounting angle; 90/270 means the upright portrait image is frameH wide. */
+    @Volatile var sensorOrientation = 90
     @Volatile var recording = false
     @Volatile var timestampIsRealtime = false
 
@@ -236,7 +239,8 @@ class GlSlicer(private val listener: Listener) {
         if (recording || statsFrame) {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
             GLES20.glViewport(0, 0, w, OUT_HEIGHT)
-            val dispW = if (rotation == 90 || rotation == 270) frameH else frameW
+            val portrait = (sensorOrientation + rotation) % 180 == 90
+            val dispW = if (portrait) frameH else frameW
             val half = (w / 2f) / dispW
             draw(linePos - half, 0f, linePos + half, 1f)
             readBuf.position(0)

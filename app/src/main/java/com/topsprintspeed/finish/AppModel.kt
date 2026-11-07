@@ -103,7 +103,7 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
 
     fun openCamera() {
         if (!hasCameraPermission) return
-        camera.open(settings.fps, settings.shutter, settings.rotationOverride)
+        camera.open(settings.fps, settings.shutter, settings.rotationOverride, settings.sharpnessPriority)
     }
 
     fun closeCamera() {
@@ -469,6 +469,15 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         activity.startActivity(Intent.createChooser(send, title))
+    }
+
+    fun shareCameraReport() {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Sprint Finish camera report")
+            putExtra(Intent.EXTRA_TEXT, camera.report)
+        }
+        activity.startActivity(Intent.createChooser(send, "Send camera report"))
     }
 
     fun shareBvid(file: File) = share(file, "application/octet-stream", file.name)

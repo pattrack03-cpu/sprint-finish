@@ -11,6 +11,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
@@ -25,25 +26,38 @@ data class CameraStatus(
     val checking: Boolean = false,
     val checked: Boolean = false,
     val highSpeed: Boolean = false,
+    val sharpMode: Boolean = false,
     val fps: Int = 0,
     val measuredFps: Double = 0.0,
     val size: String = "",
     val shutterNs: Long = 0L,
+    val targetShutterNs: Long = 0L,
     val iso: Int = 0,
+    val evComp: Int = 0,
     val manualControl: Boolean = false,
     val focusLocked: Boolean = false,
     val brightness: Double = 0.0,
-    val rotation: Int = 90,
+    val rotation: Int = 0,
+    /** Problems that should stop a race until fixed (or the user starts anyway). */
     val issues: List<String> = emptyList(),
+    /** Things worth knowing that don't block a race. */
+    val notes: List<String> = emptyList(),
 ) {
     val ok get() = checked && issues.isEmpty()
     val shutterLabel: String get() = if (shutterNs <= 0) "—" else "1/" + (1e9 / shutterNs).roundToInt()
 }
 
 /**
- * Opens the back camera at 240 or 120 fps (high-speed mode) when the phone supports it, then runs
- * "auto setup": lets auto-exposure settle, switches to a fast fixed shutter with matching ISO,
- * locks focus, and checks that the phone really applied it. Problems end up in [CameraStatus.issues].
+ * Opens the back camera and runs "auto setup".
+ *
+ * High-speed mode (120/240 fps): Android's constrained high-speed sessions only honour auto exposure —
+ * turning auto exposure off to force a shutter makes many phones (Samsung included) fall back to 30 fps.
+ * So in high-speed mode we keep auto exposure ON and push it towards a faster shutter with negative
+ * exposure compensation, stopping before the picture gets too dark. The frame rate itself caps the
+ * slowest shutter (1/240 s at 240 fps).
+ *
+ * Sharpness priority: a normal session with a truly fixed shutter (1/1000, 1/2000…) at the highest frame
+ * rate the phone allows outside high-speed mode (often 60 fps).
  */
 class CameraController(
     context: Context,
@@ -58,16 +72,20 @@ class CameraController(
     private var session: CameraCaptureSession? = null
     private var surface: Surface? = null
     private var useHighSpeed = false
+    private var sharpMode = false
     private var fpsRange = Range(30, 30)
     private var fpsTarget = 30
     private var shutterWanted = 0
     private var manualSupported = false
     private var isoRange = Range(100, 1600)
     private var expRange = Range(100_000L, 100_000_000L)
+    private var evRange = Range(0, 0)
+    private var evStep = 0.0
     private var baseIssues = mutableListOf<String>()
     private var generation = 0
 
     private var manualExposure: Pair<Long, Int>? = null
+    private var evComp = 0
     private var focusLocked = false
     private var focusDistance = 0f
 
@@ -77,15 +95,29 @@ class CameraController(
     @Volatile var measuredFps = 0.0
     @Volatile var meanLuma = 0.0
 
+    /** Plain-text description of the camera and what auto setup did; shared from Settings. */
+    @Volatile var report: String = "Camera not opened yet."
+        private set
+    private val charsText = StringBuilder()
+    private val log = StringBuilder()
+
     private var status = CameraStatus()
 
-    private fun publish(s: CameraStatus) { status = s; onStatus(s) }
+    private fun publish(s: CameraStatus) {
+        status = s
+        report = buildReport()
+        onStatus(s)
+    }
 
-    fun open(fps: Int, shutter: Int, rotationOverride: Int) {
+    private fun logLine(s: String) {
+        log.append(String.format(java.util.Locale.US, "%6.1fs  ", (System.nanoTime() % 1_000_000_000_000L) / 1e9)).append(s).append('\n')
+    }
+
+    fun open(fps: Int, shutter: Int, rotationOverride: Int, sharpnessPriority: Boolean) {
         handler.post {
             closeInternal()
             generation++
-            openInternal(fps, shutter, rotationOverride, generation)
+            openInternal(fps, shutter, rotationOverride, sharpnessPriority, generation)
         }
     }
 
@@ -110,8 +142,65 @@ class CameraController(
     private fun nearest(sizes: Array<Size>, w: Int, h: Int): Size =
         sizes.minByOrNull { abs(it.width * it.height - w * h) + abs(it.width - w) } ?: Size(w, h)
 
+    private fun describe(id: String, ch: CameraCharacteristics) {
+        charsText.setLength(0)
+        val level = when (ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+            CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
+            CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
+            CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
+            CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
+            CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "EXTERNAL"
+            else -> "?"
+        }
+        val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+        val capNames = caps.map {
+            when (it) {
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR -> "MANUAL_SENSOR"
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO -> "HIGH_SPEED_VIDEO"
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_READ_SENSOR_SETTINGS -> "READ_SENSOR_SETTINGS"
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE -> "BURST_CAPTURE"
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW -> "RAW"
+                CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA -> "LOGICAL_MULTI_CAMERA"
+                else -> "cap$it"
+            }
+        }
+        val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        charsText.append("Phone: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT})\n")
+        charsText.append("Camera id $id · hardware level $level\n")
+        charsText.append("Capabilities: ${capNames.joinToString()}\n")
+        charsText.append("Sensor orientation: ${ch.get(CameraCharacteristics.SENSOR_ORIENTATION)}°\n")
+        charsText.append("Exposure time range: ${ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)} ns\n")
+        charsText.append("ISO range: ${ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)}\n")
+        charsText.append("Exposure compensation: ${ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)} × ${ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)} EV\n")
+        charsText.append("Normal fps ranges: ${ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString()}\n")
+        if (map != null) {
+            val hs = map.highSpeedVideoSizes.joinToString { s ->
+                "${s.width}x${s.height} " + map.getHighSpeedVideoFpsRangesFor(s).joinToString("/")
+            }
+            charsText.append("High-speed sizes: ${hs.ifEmpty { "none" }}\n")
+            val s720 = nearest(map.getOutputSizes(android.graphics.SurfaceTexture::class.java), 1280, 720)
+            val minDur = map.getOutputMinFrameDuration(android.graphics.SurfaceTexture::class.java, s720)
+            charsText.append("Normal ${s720.width}x${s720.height} min frame duration: $minDur ns (max ${if (minDur > 0) (1e9 / minDur).roundToInt() else 0} fps)\n")
+        }
+        charsText.append("Timestamp source: ${if (ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "REALTIME" else "UNKNOWN"}\n")
+    }
+
+    private fun buildReport(): String {
+        val s = status
+        return buildString {
+            append("Sprint Finish camera report\n\n")
+            append(charsText)
+            append("\nCurrent: ${if (s.sharpMode) "sharpness priority (normal session)" else if (s.highSpeed) "high-speed session" else "normal session"} · " +
+                "${s.fps} fps wanted · ${s.measuredFps.roundToInt()} fps measured · shutter ${s.shutterLabel} s · ISO ${s.iso} · EV ${s.evComp} · brightness ${s.brightness.roundToInt()}\n")
+            if (s.issues.isNotEmpty()) append("Issues: ${s.issues.joinToString(" | ")}\n")
+            if (s.notes.isNotEmpty()) append("Notes: ${s.notes.joinToString(" | ")}\n")
+            append("\nAuto setup log:\n").append(log)
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    private fun openInternal(fps: Int, shutter: Int, rotationOverride: Int, gen: Int) {
+    private fun openInternal(fps: Int, shutter: Int, rotationOverride: Int, sharpnessPriority: Boolean, gen: Int) {
+        log.setLength(0)
         val issues = mutableListOf<String>()
         val id = try {
             mgr.cameraIdList.firstOrNull {
@@ -123,11 +212,14 @@ class CameraController(
             return
         }
         val ch = mgr.getCameraCharacteristics(id)
+        describe(id, ch)
         val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val hsCap = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO)
         manualSupported = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
         ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoRange = it }
         ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expRange = it }
+        ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { evRange = it }
+        evStep = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toDouble() ?: 0.0
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         if (map == null) {
             publish(CameraStatus(checked = true, issues = listOf("Camera gave no video formats")))
@@ -136,7 +228,9 @@ class CameraController(
 
         var size = Size(1280, 720)
         useHighSpeed = false
-        if (fps >= 120 && hsCap) {
+        sharpMode = sharpnessPriority && manualSupported
+        if (sharpnessPriority && !manualSupported) issues += "Sharpness priority needs manual shutter, which this phone doesn't allow"
+        if (fps >= 120 && hsCap && !sharpMode) {
             fun findHs(f: Int): Size? = map.highSpeedVideoSizes
                 .sortedBy { abs(it.width * it.height - 1280 * 720) }
                 .firstOrNull { s -> map.getHighSpeedVideoFpsRangesFor(s).any { it.lower == f && it.upper == f } }
@@ -154,24 +248,27 @@ class CameraController(
             size = nearest(map.getOutputSizes(android.graphics.SurfaceTexture::class.java), 1280, 720)
             val ranges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: arrayOf(Range(30, 30))
             val best = ranges.maxWithOrNull(compareBy<Range<Int>>({ it.upper }, { it.lower })) ?: Range(30, 30)
-            fpsRange = best
+            fpsRange = Range(best.upper, best.upper).let { fixed -> if (ranges.contains(fixed)) fixed else best }
             fpsTarget = best.upper
-            if (fps >= 120) issues += "High-speed (120/240 fps) not available — using ${best.upper} fps"
+            if (fps >= 120 && !sharpMode) issues += "High-speed (120/240 fps) not available — using ${best.upper} fps"
         }
         baseIssues = issues
         shutterWanted = shutter
+        logLine("Open ${if (useHighSpeed) "high-speed" else "normal"} ${size.width}x${size.height} @ $fpsRange" + if (sharpMode) " (sharpness priority)" else "")
 
         val tsSource = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
         slicer.timestampIsRealtime = tsSource == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
-        val sensorRot = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val rot = if (rotationOverride >= 0) rotationOverride else sensorRot
+        // Android already rotates the camera image for an upright preview; we only add a user override.
+        slicer.sensorOrientation = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val rot = if (rotationOverride >= 0) rotationOverride else 0
         slicer.rotation = rot
 
         val surf = slicer.configureInput(size.width, size.height)
         surface = surf
         manualExposure = null
+        evComp = 0
         focusLocked = false
-        publish(CameraStatus(open = false, checking = true, fps = fpsTarget, highSpeed = useHighSpeed,
+        publish(CameraStatus(open = false, checking = true, fps = fpsTarget, highSpeed = useHighSpeed, sharpMode = sharpMode,
             size = "${size.width}×${size.height}", rotation = rot, manualControl = manualSupported))
 
         try {
@@ -205,11 +302,11 @@ class CameraController(
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
                 if (useHighSpeed) {
-                    // Fall back to a normal session.
                     useHighSpeed = false
                     fpsRange = Range(30, 30)
                     fpsTarget = 30
                     baseIssues = (baseIssues + "High-speed session refused — using 30 fps").toMutableList()
+                    logLine("High-speed session refused; falling back to normal")
                     createSession(d, surf, gen)
                 } else {
                     publish(status.copy(checking = false, checked = true, issues = listOf("Camera session failed")))
@@ -242,15 +339,18 @@ class CameraController(
             b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
             val m = manualExposure
-            if (m != null) {
+            if (m != null && !useHighSpeed) {
                 b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, m.first)
                 b.set(CaptureRequest.SENSOR_SENSITIVITY, m.second)
                 b.set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / fpsTarget)
             } else {
+                // High-speed sessions only work with auto exposure on.
                 b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evComp)
+                b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF)
             }
-            if (focusLocked && manualSupported && focusDistance > 0f) {
+            if (focusLocked && manualSupported && focusDistance > 0f && !useHighSpeed) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
                 b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
             } else {
@@ -263,22 +363,56 @@ class CameraController(
                 s.setRepeatingRequest(b.build(), captureCb, handler)
             }
         } catch (e: Exception) {
+            logLine("Camera rejected request: ${e.message}")
             baseIssues = (baseIssues + "Camera rejected settings: ${e.message}").toMutableList()
         }
     }
 
-    /** Step 1: let auto exposure/focus settle. */
-    private fun startAutoSetup(gen: Int) {
-        manualExposure = null
-        focusLocked = false
-        publish(status.copy(checking = true, checked = false, issues = emptyList()))
-        submit()
-        handler.postDelayed({ if (gen == generation) lockSettings(gen) }, 1500)
+    private fun targetShutterNs(): Long {
+        val denom = if (shutterWanted > 0) shutterWanted else 1000
+        return 1_000_000_000L / denom
     }
 
-    /** Step 2: fixed fast shutter + matching ISO, focus locked where she phone allows it. */
-    private fun lockSettings(gen: Int) {
-        val issues = baseIssues.toMutableList()
+    private fun snapshot(label: String) {
+        logLine("$label: ${measuredFps.roundToInt()} fps, shutter ${if (lastExposureNs > 0) "1/" + (1e9 / lastExposureNs).roundToInt() else "?"} s, ISO $lastIso, EV $evComp, brightness ${meanLuma.roundToInt()}")
+    }
+
+    /** Step 1: auto exposure/focus settle. */
+    private fun startAutoSetup(gen: Int) {
+        manualExposure = null
+        evComp = 0
+        focusLocked = false
+        publish(status.copy(checking = true, checked = false, issues = emptyList(), notes = emptyList()))
+        submit()
+        handler.postDelayed({ if (gen == generation) afterSettle(gen) }, 1500)
+    }
+
+    private fun afterSettle(gen: Int) {
+        snapshot("Auto exposure settled")
+        if (useHighSpeed) stepExposureDown(gen) else lockManual(gen)
+    }
+
+    /** High-speed: nudge auto exposure darker one step at a time until the shutter is fast enough. */
+    private fun stepExposureDown(gen: Int) {
+        val target = targetShutterNs()
+        val fastEnough = lastExposureNs in 1..(target * 11 / 10)
+        val tooDark = meanLuma in 0.1..55.0
+        if (fastEnough || tooDark || evComp <= evRange.lower) {
+            snapshot(when {
+                fastEnough -> "Shutter target reached"
+                tooDark -> "Stopped: image getting dark"
+                else -> "Stopped: lowest exposure compensation"
+            })
+            handler.postDelayed({ if (gen == generation) verify(gen) }, 600)
+            return
+        }
+        evComp -= 1
+        submit()
+        handler.postDelayed({ if (gen == generation) stepExposureDown(gen) }, 450)
+    }
+
+    /** Normal session: fixed fast shutter + matching ISO and locked focus. */
+    private fun lockManual(gen: Int) {
         if (manualSupported && lastExposureNs > 0 && lastIso > 0) {
             val isoMax = minOf(isoRange.upper, 3200)
             val candidates = if (shutterWanted > 0) listOf(shutterWanted) else listOf(2000, 1000, 500)
@@ -287,32 +421,40 @@ class CameraController(
             manualExposure = exp to iso.coerceIn(isoRange.lower, isoMax)
             focusDistance = lastFocus
             focusLocked = true
+            logLine("Manual shutter 1/$shutter s, ISO ${manualExposure?.second}")
             submit()
-        } else if (!manualSupported) {
-            issues += "This phone doesn't allow setting the shutter speed — using auto exposure"
         }
-        handler.postDelayed({ if (gen == generation) verify(gen, issues) }, 1500)
+        handler.postDelayed({ if (gen == generation) verify(gen) }, 1500)
     }
 
     /** Step 3: check what the camera actually did. */
-    private fun verify(gen: Int, issues: MutableList<String>) {
+    private fun verify(gen: Int) {
+        snapshot("Check")
+        val issues = baseIssues.toMutableList()
+        val notes = mutableListOf<String>()
+        val target = targetShutterNs()
+        val shutterTxt = if (lastExposureNs > 0) "1/${(1e9 / lastExposureNs).roundToInt()} s" else "?"
         val m = manualExposure
-        if (m != null && lastExposureNs > 0) {
+        if (m != null) {
             val diff = abs(lastExposureNs - m.first).toDouble() / m.first
-            if (diff > 0.25) issues += "Shutter not applied (camera is using 1/${(1e9 / lastExposureNs).roundToInt()} s)"
-        } else if (lastExposureNs > 2_000_000L) {
-            issues += "Shutter is slow (1/${(1e9 / lastExposureNs).roundToInt()} s) — runners may blur"
+            if (diff > 0.25) issues += "Shutter not applied (camera is using $shutterTxt)"
+        } else if (lastExposureNs > 0) {
+            when {
+                lastExposureNs > 4_200_000L -> issues += "Shutter is slow ($shutterTxt) — runners will blur. More light, or use Sharpness priority"
+                lastExposureNs > target * 5 / 4 -> notes += "Shutter $shutterTxt (high-speed mode keeps auto exposure; brighter light gives a faster shutter)"
+            }
         }
+        if (!useHighSpeed && !manualSupported) notes += "This phone doesn't allow a manual shutter"
         if (measuredFps > 0 && measuredFps < fpsTarget * 0.85) {
             issues += "Frame rate only ${measuredFps.roundToInt()} fps (wanted $fpsTarget)"
         }
         if (measuredFps == 0.0) issues += "No frames from the camera"
-        if (meanLuma in 0.1..35.0) issues += "Image too dark — more light, or a slower shutter"
-        if (meanLuma > 235.0) issues += "Image too bright — try a faster shutter"
+        if (meanLuma in 0.1..30.0) issues += "Image too dark — more light needed"
+        if (meanLuma > 235.0) issues += "Image too bright"
         publish(status.copy(
             open = true, checking = false, checked = true,
-            measuredFps = measuredFps, shutterNs = lastExposureNs, iso = lastIso,
-            focusLocked = focusLocked, brightness = meanLuma, issues = issues.distinct(),
+            measuredFps = measuredFps, shutterNs = lastExposureNs, targetShutterNs = target, iso = lastIso, evComp = evComp,
+            focusLocked = focusLocked, brightness = meanLuma, issues = issues.distinct(), notes = notes.distinct(),
         ))
     }
 }

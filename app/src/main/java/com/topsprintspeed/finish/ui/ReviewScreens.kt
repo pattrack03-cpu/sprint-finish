@@ -315,13 +315,26 @@ fun SettingsScreen(m: AppModel) {
                 }
                 LineButton("Run again", { m.rerunAutoSetup() }, Modifier.width(120.dp), enabled = !st.checking && st.open)
             }
-            CheckRow("High-speed mode", st.highSpeed, if (st.fps > 0) "${st.fps} fps · ${st.size}" else "—")
+            CheckRow("Mode", st.highSpeed || st.sharpMode,
+                if (st.sharpMode) "sharpness · ${st.fps} fps" else if (st.highSpeed) "high-speed ${st.fps} fps · ${st.size}" else "normal ${st.fps} fps")
             CheckRow("Measured frame rate", st.measuredFps >= st.fps * 0.85 && st.fps > 0, "${st.measuredFps.roundToInt()} fps")
-            CheckRow("Shutter speed", st.manualControl && st.issues.none { it.startsWith("Shutter") }, "${st.shutterLabel} s · ISO ${st.iso}")
-            CheckRow("Exposure", st.brightness in 35.0..235.0, "brightness ${st.brightness.roundToInt()}")
+            CheckRow("Shutter speed", st.issues.none { it.startsWith("Shutter") },
+                "${st.shutterLabel} s · ISO ${st.iso}" + if (st.evComp != 0) " · EV ${st.evComp}" else "")
+            CheckRow("Exposure", st.brightness in 30.0..235.0, "brightness ${st.brightness.roundToInt()}")
             CheckRow("Focus locked", st.focusLocked, if (st.focusLocked) "locked" else "auto")
             st.issues.forEach { Text("• $it", color = Palette.GoldLight, fontSize = 13.sp) }
+            st.notes.forEach { Text("ℹ $it", color = Palette.Ink2, fontSize = 12.sp) }
+            LineButton("Send camera report", { m.shareCameraReport() }, Modifier.fillMaxWidth())
         }
+
+        Label("Priority")
+        Segmented(listOf("Frame rate", "Sharpness"), if (s.sharpnessPriority) 1 else 0, enabled = !m.running) {
+            s.update { sharpnessPriority = it == 1 }; m.applyCameraSettings()
+        }
+        Label(if (s.sharpnessPriority)
+            "Fixed fast shutter at the highest frame rate this phone allows outside high-speed mode (often 60 fps)."
+        else
+            "Highest frame rate. Shutter is set by auto exposure, pushed as fast as the light allows.")
 
         Label("Frame rate")
         val fpsOpts = listOf(60, 120, 240)
@@ -341,7 +354,7 @@ fun SettingsScreen(m: AppModel) {
         Segmented(Direction.values().map { it.label }, s.direction.ordinal, enabled = !m.running) {
             s.update { direction = Direction.values()[it] }
         }
-        Label("Image rotation (change only if the preview is sideways)")
+        Label("Extra image rotation (only if the preview is still sideways)")
         val rotOpts = listOf(-1, 0, 90, 180, 270)
         Segmented(rotOpts.map { if (it < 0) "Auto" else "$it°" }, rotOpts.indexOf(s.rotationOverride).coerceAtLeast(0), enabled = !m.running) {
             s.update { rotationOverride = rotOpts[it] }; m.applyCameraSettings()
