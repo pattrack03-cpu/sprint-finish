@@ -28,7 +28,7 @@ class Recording(
     val height: Int,
     val direction: Direction,
     var startMono: Long,
-    val offsetS: Double,
+    var offsetS: Double,
     val startMode: String,
     val createdAt: Long,
 ) {

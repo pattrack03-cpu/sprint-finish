@@ -65,6 +65,7 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
     val clipSpans = mutableStateListOf<Pair<Double, Double?>>()
     val splits = mutableStateListOf<Long>()
     var saving by mutableStateOf(false)
+    var raceOffset by mutableStateOf(0.0)
 
     // Review / results
     var review by mutableStateOf<ReviewSession?>(null)
@@ -263,8 +264,11 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
         )
         startMono = mono
         endMono = null
+        raceOffset = current?.offsetS ?: 0.0
         clipSpans.clear()
         splits.clear()
+        // Straight to the finish-line camera the moment the race starts.
+        tab = Tab.FINISH
     }
 
     /** "Released too early? Tap at the real start" — moves the start to now; every time shifts with it. */
@@ -282,13 +286,11 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
         toast = "Start moved to your tap"
     }
 
-    fun nudgeStart(seconds: Double) {
-        // Adjusts the current race's offset after the fact (positive = slower times).
+    /** Changes this race's offset (positive = slower times). Applies to every time already recorded too. */
+    fun adjustRaceOffset(delta: Double) {
         val rec = current ?: return
-        val mono = startMono ?: return
-        val newMono = mono - (seconds * 1e9).toLong()
-        startMono = newMono
-        synchronized(rec) { rec.startMono = newMono }
+        synchronized(rec) { rec.offsetS = Math.round((rec.offsetS + delta) * 100.0) / 100.0 }
+        raceOffset = rec.offsetS
     }
 
     // ---------------- Finish recording ----------------

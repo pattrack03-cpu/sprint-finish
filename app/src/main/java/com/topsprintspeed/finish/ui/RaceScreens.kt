@@ -2,8 +2,11 @@
 
 package com.topsprintspeed.finish.ui
 
+import android.app.Activity
+import android.content.pm.ActivityInfo
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -48,6 +51,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
@@ -59,11 +63,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.topsprintspeed.finish.AppModel
 import com.topsprintspeed.finish.StartMode
 import com.topsprintspeed.finish.Tab
@@ -91,34 +99,58 @@ fun AppRoot(m: AppModel) {
             snackbar.showSnackbar(t)
         }
     }
-    Scaffold(
-        containerColor = Palette.Black,
-        snackbarHost = { SnackbarHost(snackbar) },
-        bottomBar = {
-            NavigationBar(containerColor = Palette.Nav) {
-                Tab.values().forEach { t ->
-                    NavigationBarItem(
-                        selected = m.tab == t,
-                        onClick = { m.tab = t },
-                        icon = { Icon(iconFor(t), contentDescription = null) },
-                        label = { Text(t.label, fontSize = 11.sp) },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Palette.Black, indicatorColor = Palette.Gold,
-                            selectedTextColor = Palette.Gold, unselectedIconColor = Palette.Muted,
-                            unselectedTextColor = Palette.Muted,
-                        ),
-                    )
-                }
+    val fullReview = m.tab == Tab.REVIEW && m.review != null && !m.reviewLoading
+    val activity = LocalContext.current as? Activity
+    DisposableEffect(fullReview) {
+        activity?.requestedOrientation =
+            if (fullReview) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        activity?.window?.let { w ->
+            val c = WindowCompat.getInsetsController(w, w.decorView)
+            if (fullReview) {
+                c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                c.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                c.show(WindowInsetsCompat.Type.systemBars())
             }
-        },
-    ) { pad ->
-        Box(Modifier.padding(pad).fillMaxSize().background(Palette.Black)) {
-            when (m.tab) {
-                Tab.START -> StartScreen(m)
-                Tab.FINISH -> FinishScreen(m)
-                Tab.REVIEW -> ReviewScreen(m)
-                Tab.RESULTS -> ResultsScreen(m) { importer.launch(arrayOf("*/*")) }
-                Tab.SETTINGS -> SettingsScreen(m)
+        }
+        onDispose { }
+    }
+    if (fullReview) {
+        BackHandler { m.tab = Tab.RESULTS }
+        Box(Modifier.fillMaxSize().background(Palette.Black)) {
+            ReviewScreen(m)
+            SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
+        }
+    } else {
+        Scaffold(
+            containerColor = Palette.Black,
+            snackbarHost = { SnackbarHost(snackbar) },
+            bottomBar = {
+                NavigationBar(containerColor = Palette.Nav) {
+                    Tab.values().forEach { t ->
+                        NavigationBarItem(
+                            selected = m.tab == t,
+                            onClick = { m.tab = t },
+                            icon = { Icon(iconFor(t), contentDescription = null) },
+                            label = { Text(t.label, fontSize = 11.sp) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = Palette.Black, indicatorColor = Palette.Gold,
+                                selectedTextColor = Palette.Gold, unselectedIconColor = Palette.Muted,
+                                unselectedTextColor = Palette.Muted,
+                            ),
+                        )
+                    }
+                }
+            },
+        ) { pad ->
+            Box(Modifier.padding(pad).fillMaxSize().background(Palette.Black)) {
+                when (m.tab) {
+                    Tab.START -> StartScreen(m)
+                    Tab.FINISH -> FinishScreen(m)
+                    Tab.REVIEW -> ReviewScreen(m)
+                    Tab.RESULTS -> ResultsScreen(m) { importer.launch(arrayOf("*/*")) }
+                    Tab.SETTINGS -> SettingsScreen(m)
+                }
             }
         }
     }
@@ -377,6 +409,14 @@ fun FinishScreen(m: AppModel) {
         }
 
         Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            LineButton("Released too early? Tap at the real start", { m.correctStartToNow() },
+                Modifier.fillMaxWidth(), enabled = m.running)
+            Stepper(
+                "Race offset",
+                (if (m.raceOffset >= 0) "+" else "−") + String.format(java.util.Locale.US, "%.2f s", kotlin.math.abs(m.raceOffset)),
+                onMinus = { m.adjustRaceOffset(-0.01) },
+                onPlus = { m.adjustRaceOffset(0.01) },
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (m.recordingNow) {
                     MaroonButton("❚❚  Pause recording", { m.pauseRecording() }, Modifier.weight(1f))
