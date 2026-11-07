@@ -100,6 +100,10 @@ class GlSlicer(private val listener: Listener) {
     @Volatile var recording = false
     @Volatile var timestampIsRealtime = false
 
+    /** Latest camera texture transform (display coords -> camera buffer); used to cut the line from recorded video. */
+    @Volatile var lastTransform: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
+        private set
+
     private var frameCount = 0L
     private var lastTs = 0L
     private var fpsEma = 0.0
@@ -223,6 +227,7 @@ class GlSlicer(private val listener: Listener) {
         var ts = st.timestamp
         if (timestampIsRealtime) ts -= (SystemClock.elapsedRealtimeNanos() - System.nanoTime())
         st.getTransformMatrix(stMatrix)
+        if (frameCount % 30L == 0L) lastTransform = stMatrix.copyOf()
 
         if (lastTs > 0) {
             val dt = ts - lastTs

@@ -103,6 +103,39 @@ class CameraController(
 
     private var status = CameraStatus()
 
+    // Full-rate recording path (video encoder).
+    private var encoder: FrameEncoder? = null
+    @Volatile var codecConfig: ByteArray? = null
+        private set
+    /** Receives every encoded frame while [setWantFrames] is on: (time on System.nanoTime clock, H.264 data, key frame). */
+    @Volatile var frameSink: ((Long, ByteArray, Boolean) -> Unit)? = null
+    @Volatile var frameW = 1280
+        private set
+    @Volatile var frameH = 720
+        private set
+    val encoding: Boolean get() = encoder != null && session != null
+    private var resultCount = 0
+    private var resultWindowStart = 0L
+    @Volatile private var resultRate = 0.0
+
+    fun setWantFrames(on: Boolean) {
+        val e = encoder ?: return
+        if (on) e.requestKeyFrame()
+        e.wantFrames = on
+    }
+
+    private val encListener = object : FrameEncoder.Listener {
+        override fun onConfig(config: ByteArray) { codecConfig = config }
+        override fun onEncodedFrame(tsMono: Long, data: ByteArray, key: Boolean) { frameSink?.invoke(tsMono, data, key) }
+        override fun onEncoderFps(fps: Double) { measuredFps = fps }
+    }
+
+    private fun releaseEncoder() {
+        encoder?.release()
+        encoder = null
+        codecConfig = null
+    }
+
     private fun publish(s: CameraStatus) {
         status = s
         report = buildReport()
@@ -135,6 +168,7 @@ class CameraController(
         try { device?.close() } catch (_: Exception) {}
         session = null
         device = null
+        releaseEncoder()
         slicer.recording = false
         publish(status.copy(open = false, checking = false))
     }
@@ -190,6 +224,7 @@ class CameraController(
         return buildString {
             append("Sprint Finish camera report\n\n")
             append(charsText)
+            append("Recording path: ${if (encoder != null) "hardware video encoder (full frame rate)" else "preview frames"}\n")
             append("\nCurrent: ${if (s.sharpMode) "sharpness priority (normal session)" else if (s.highSpeed) "high-speed session" else "normal session"} · " +
                 "${s.fps} fps wanted · ${s.measuredFps.roundToInt()} fps measured · shutter ${s.shutterLabel} s · ISO ${s.iso} · EV ${s.evComp} · brightness ${s.brightness.roundToInt()}\n")
             if (s.issues.isNotEmpty()) append("Issues: ${s.issues.joinToString(" | ")}\n")
@@ -265,6 +300,16 @@ class CameraController(
 
         val surf = slicer.configureInput(size.width, size.height)
         surface = surf
+        frameW = size.width
+        frameH = size.height
+        releaseEncoder()
+        encoder = try {
+            FrameEncoder(size.width, size.height, fpsTarget, slicer.timestampIsRealtime, encListener)
+        } catch (e: Exception) {
+            logLine("Video encoder couldn't start at $fpsTarget fps: ${e.message}")
+            null
+        }
+        logLine(if (encoder != null) "Video encoder ready (${size.width}x${size.height} @ $fpsTarget)" else "No video encoder — recording from preview frames")
         manualExposure = null
         evComp = 0
         focusLocked = false
@@ -301,10 +346,17 @@ class CameraController(
                 startAutoSetup(gen)
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
-                if (useHighSpeed) {
+                if (encoder != null && !useHighSpeed) {
+                    logLine("Session with encoder refused; trying preview only")
+                    releaseEncoder()
+                    createSession(d, surf, gen)
+                } else if (useHighSpeed) {
                     useHighSpeed = false
                     fpsRange = Range(30, 30)
                     fpsTarget = 30
+                    // Encoder was sized for high speed; rebuild it for 30 fps.
+                    releaseEncoder()
+                    encoder = try { FrameEncoder(frameW, frameH, 30, slicer.timestampIsRealtime, encListener) } catch (e: Exception) { null }
                     baseIssues = (baseIssues + "High-speed session refused — using 30 fps").toMutableList()
                     logLine("High-speed session refused; falling back to normal")
                     createSession(d, surf, gen)
@@ -314,8 +366,9 @@ class CameraController(
             }
         }
         try {
-            if (useHighSpeed) d.createConstrainedHighSpeedCaptureSession(listOf(surf), cb, handler)
-            else d.createCaptureSession(listOf(surf), cb, handler)
+            val outputs = listOfNotNull(surf, encoder?.inputSurface)
+            if (useHighSpeed) d.createConstrainedHighSpeedCaptureSession(outputs, cb, handler)
+            else d.createCaptureSession(outputs, cb, handler)
         } catch (e: Exception) {
             publish(status.copy(checking = false, checked = true, issues = listOf("Camera session failed: ${e.message}")))
         }
@@ -326,6 +379,14 @@ class CameraController(
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExposureNs = it }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocus = it }
+            val now = System.nanoTime()
+            if (resultWindowStart == 0L) resultWindowStart = now
+            resultCount++
+            if (now - resultWindowStart >= 1_000_000_000L) {
+                resultRate = resultCount * 1e9 / (now - resultWindowStart)
+                resultCount = 0
+                resultWindowStart = now
+            }
         }
     }
 
@@ -336,6 +397,7 @@ class CameraController(
         try {
             val b = d.createCaptureRequest(if (useHighSpeed) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(surf)
+            encoder?.let { b.addTarget(it.inputSurface) }
             b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
             val m = manualExposure
@@ -374,7 +436,7 @@ class CameraController(
     }
 
     private fun snapshot(label: String) {
-        logLine("$label: ${measuredFps.roundToInt()} fps, shutter ${if (lastExposureNs > 0) "1/" + (1e9 / lastExposureNs).roundToInt() else "?"} s, ISO $lastIso, EV $evComp, brightness ${meanLuma.roundToInt()}")
+        logLine("$label: ${measuredFps.roundToInt()} fps recorded (camera ${resultRate.roundToInt()}/s), shutter ${if (lastExposureNs > 0) "1/" + (1e9 / lastExposureNs).roundToInt() else "?"} s, ISO $lastIso, EV $evComp, brightness ${meanLuma.roundToInt()}")
     }
 
     /** Step 1: auto exposure/focus settle. */

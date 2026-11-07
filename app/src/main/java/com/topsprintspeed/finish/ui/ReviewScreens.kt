@@ -126,6 +126,7 @@ fun ReviewScreen(m: AppModel) {
                 LineButton("−", { zoom = (zoom / 1.5f).coerceIn(0.5f, 10f) }, Modifier.weight(1f))
                 LineButton("Zoom +", { zoom = (zoom * 1.5f).coerceIn(0.5f, 10f) }, Modifier.weight(1f))
             }
+            LineButton(if (r.flipVertical) "Flip image back" else "Image upside down? Flip", { m.toggleFlip() }, Modifier.fillMaxWidth())
             OutlinedTextField(lane, { lane = it }, label = { Text("Lane") }, singleLine = true,
                 modifier = Modifier.fillMaxWidth(), colors = fieldColors())
             OutlinedTextField(athlete, { athlete = it }, label = { Text("Athlete") }, singleLine = true,

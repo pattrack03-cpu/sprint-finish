@@ -36,6 +36,7 @@ class ReviewSession(val file: File, val rec: Recording, heat: String, marks: Lis
     var bitmap by mutableStateOf<Bitmap?>(null)
     var ticks by mutableStateOf<List<Pair<Int, Double>>>(emptyList())
     var heat by mutableStateOf(heat)
+    var flipVertical by mutableStateOf(false)
     val marks = mutableStateListOf<Mark>().apply { addAll(marks) }
 }
 
@@ -86,6 +87,7 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
     val racesDir: File = File(ctx.filesDir, "races").apply { mkdirs() }
 
     init {
+        camera.frameSink = { ts, data, key -> onEncodedFrame(ts, data, key) }
         slicer.linePos = settings.linePos
         slicer.sliceWidth = settings.sliceWidth
         createNotificationChannel()
@@ -141,7 +143,7 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
     }
 
     override fun onFrameStats(fps: Double, meanLuma: Double) {
-        camera.measuredFps = fps
+        if (!camera.encoding) camera.measuredFps = fps
         camera.meanLuma = meanLuma
         main.post { liveFps = fps }
     }
@@ -159,6 +161,18 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
             }
             clip.ts.add(tsMono)
             clip.slices.add(rgba)
+        }
+    }
+
+    private fun onEncodedFrame(tsMono: Long, data: ByteArray, key: Boolean) {
+        val rec = current ?: return
+        synchronized(rec) {
+            val clip = rec.clips.lastOrNull() ?: return
+            if (clip.frames.isEmpty() && !key) return // a clip must start on a key frame
+            if (clip.size >= 20_000 / clip.sliceW) return
+            clip.ts.add(tsMono)
+            clip.frames.add(data)
+            clip.keys.add(key)
         }
     }
 
@@ -262,6 +276,14 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
             startMode = mode.label,
             createdAt = System.currentTimeMillis(),
         )
+        current?.let { rec ->
+            rec.encoded = camera.encoding
+            rec.frameW = camera.frameW
+            rec.frameH = camera.frameH
+            rec.transform = slicer.lastTransform.copyOf()
+            rec.sensorOrientation = slicer.sensorOrientation
+            rec.extraRotation = slicer.rotation
+        }
         startMono = mono
         endMono = null
         raceOffset = current?.offsetS ?: 0.0
@@ -301,13 +323,17 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
         if (!cameraStatus.open) { toast = "Camera isn't open"; return }
         slicer.linePos = settings.linePos
         slicer.sliceWidth = rec.sliceW
-        synchronized(rec) { rec.clips.add(Clip(rec.sliceW, rec.height)) }
+        synchronized(rec) {
+            rec.transform = slicer.lastTransform.copyOf()
+            rec.clips.add(Clip(rec.sliceW, rec.height, settings.linePos))
+        }
         clipSpans.add((raceTime(System.nanoTime()) ?: 0.0) to null)
-        slicer.recording = true
+        if (rec.encoded) camera.setWantFrames(true) else slicer.recording = true
         recordingNow = true
     }
 
     fun pauseRecording() {
+        camera.setWantFrames(false)
         slicer.recording = false
         recordingNow = false
         val rec = current ?: return
@@ -328,6 +354,11 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
         if (rec == null) { resetRace(); return }
         val hasFrames = synchronized(rec) { rec.clips.any { it.size > 0 } }
         if (!hasFrames) { toast = "No finish recorded — nothing to save"; return }
+        if (rec.encoded) {
+            val cfg = camera.codecConfig
+            if (cfg == null) { toast = "Video settings missing — can't save this recording"; return }
+            rec.codecConfig = cfg
+        }
         saving = true
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(rec.createdAt))
         val safe = rec.name.replace(Regex("[^A-Za-z0-9]+"), "_").trim('_').ifEmpty { "race" }
@@ -381,6 +412,7 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
                 val rec = BvidFile.read(file)
                 val (h, marks) = BvidFile.readMarks(BvidFile.marksFile(file))
                 val s = ReviewSession(file, rec, h.ifEmpty { rec.name }, marks)
+                rec.clips.firstOrNull()?.let { if (it.needsSlicing) VideoSlicer.slice(rec, it) }
                 val bmp = if (rec.clips.isNotEmpty()) PhotoFinishImage.build(rec.clips[0], rec.direction) else null
                 Triple(s, bmp, PhotoFinishImage.ticks(rec, 0))
             }
@@ -400,10 +432,18 @@ class AppModel(private val activity: MainActivity) : GlSlicer.Listener {
         if (index !in 0 until s.rec.clips.size) return
         s.clipIndex = index
         Thread {
-            val bmp = PhotoFinishImage.build(s.rec.clips[index], s.rec.direction)
+            val clip = s.rec.clips[index]
+            if (clip.needsSlicing) runCatching { VideoSlicer.slice(s.rec, clip) }
+            val bmp = PhotoFinishImage.build(clip, s.rec.direction, s.flipVertical)
             val ticks = PhotoFinishImage.ticks(s.rec, index)
             main.post { if (review === s && s.clipIndex == index) { s.bitmap = bmp; s.ticks = ticks } }
         }.start()
+    }
+
+    fun toggleFlip() {
+        val s = review ?: return
+        s.flipVertical = !s.flipVertical
+        showClip(s.clipIndex)
     }
 
     fun addMark(slice: Int, lane: String, athlete: String) {

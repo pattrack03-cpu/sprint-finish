@@ -14,10 +14,13 @@ import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
 /** One burst of finish-line recording (between Start recording and Pause). */
-class Clip(val sliceW: Int, val height: Int) {
+class Clip(val sliceW: Int, val height: Int, val linePos: Float = 0.5f) {
     val ts = ArrayList<Long>()          // frame times, System.nanoTime() clock
     val slices = ArrayList<ByteArray>() // RGBA, sliceW x height, bottom row first (OpenGL order)
+    val frames = ArrayList<ByteArray>() // H.264 access units (video recordings)
+    val keys = ArrayList<Boolean>()
     val size get() = ts.size
+    val needsSlicing get() = frames.isNotEmpty() && slices.size != ts.size
 }
 
 /** A whole race: start time plus every finish clip. Saved as a .bvid file until it is timed. */
@@ -34,6 +37,15 @@ class Recording(
 ) {
     val clips = ArrayList<Clip>()
 
+    // Video recordings: the finish line is cut out of the recorded frames afterwards.
+    var encoded = false
+    var codecConfig: ByteArray? = null
+    var transform: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
+    var frameW = 1280
+    var frameH = 720
+    var sensorOrientation = 90
+    var extraRotation = 0
+
     fun timeOf(tsMono: Long): Double = (tsMono - startMono) / 1e9 + offsetS
 
     fun sliceTime(clip: Int, slice: Int): Double = timeOf(clips[clip].ts[slice])
@@ -49,7 +61,7 @@ data class Mark(val clip: Int, val slice: Int, val time: Double, val lane: Strin
 
 /** Builds the photo-finish picture for one clip. */
 object PhotoFinishImage {
-    fun build(clip: Clip, dir: Direction): Bitmap {
+    fun build(clip: Clip, dir: Direction, flipVertical: Boolean = false): Bitmap {
         val n = clip.size
         val w = clip.sliceW
         val h = clip.height
@@ -59,7 +71,7 @@ object PhotoFinishImage {
             val data = clip.slices[k]
             val x0 = TimeMath.sliceX(k, w, n, dir)
             for (r in 0 until h) {
-                val y = h - 1 - r
+                val y = if (flipVertical) r else h - 1 - r
                 val rowBase = y * width + x0
                 for (j in 0 until w) {
                     val i = (r * w + j) * 4
@@ -110,7 +122,7 @@ data class RaceInfo(
  */
 object BvidFile {
     private val MAGIC = byteArrayOf('S'.code.toByte(), 'F'.code.toByte(), 'B'.code.toByte(), 'V'.code.toByte())
-    private const val VERSION = 1
+    private const val VERSION = 2
 
     fun write(file: File, rec: Recording) {
         val tmp = File(file.parentFile, file.name + ".tmp")
@@ -121,9 +133,13 @@ object BvidFile {
             val bytes = meta.toString().toByteArray(Charsets.UTF_8)
             out.writeInt(bytes.size)
             out.write(bytes)
-            val z = GZIPOutputStream(out, 1 shl 16)
-            for (c in rec.clips) for (s in c.slices) z.write(s)
-            z.finish()
+            if (rec.encoded) {
+                for (c in rec.clips) for (f in c.frames) out.write(f)
+            } else {
+                val z = GZIPOutputStream(out, 1 shl 16)
+                for (c in rec.clips) for (s in c.slices) z.write(s)
+                z.finish()
+            }
         }
         if (file.exists()) file.delete()
         tmp.renameTo(file)
@@ -141,12 +157,32 @@ object BvidFile {
         meta.put("offsetS", rec.offsetS)
         meta.put("startMode", rec.startMode)
         meta.put("createdAt", rec.createdAt)
+        meta.put("encoded", rec.encoded)
+        if (rec.encoded) {
+            meta.put("codec", "video/avc")
+            meta.put("config", android.util.Base64.encodeToString(rec.codecConfig ?: ByteArray(0), android.util.Base64.NO_WRAP))
+            val tf = JSONArray()
+            for (v in rec.transform) tf.put(v.toDouble())
+            meta.put("transform", tf)
+            meta.put("frameW", rec.frameW)
+            meta.put("frameH", rec.frameH)
+            meta.put("sensorOrientation", rec.sensorOrientation)
+            meta.put("extraRotation", rec.extraRotation)
+        }
         val clips = JSONArray()
         for (c in rec.clips) {
             val o = JSONObject()
             o.put("n", c.size)
             o.put("w", c.sliceW)
             o.put("h", c.height)
+            o.put("linePos", c.linePos.toDouble())
+            if (rec.encoded) {
+                val sizes = JSONArray()
+                val keys = JSONArray()
+                for (i in 0 until c.frames.size) { sizes.put(c.frames[i].size); keys.put(c.keys.getOrElse(i) { false }) }
+                o.put("sizes", sizes)
+                o.put("keys", keys)
+            }
             val ts = JSONArray()
             for (t in c.ts) ts.put(t)
             o.put("ts", ts)
@@ -183,18 +219,38 @@ object BvidFile {
                 startMode = meta.optString("startMode", ""),
                 createdAt = meta.optLong("createdAt", file.lastModified()),
             )
-            val z = DataInputStream(GZIPInputStream(input, 1 shl 16))
+            rec.encoded = meta.optBoolean("encoded", false)
+            if (rec.encoded) {
+                rec.codecConfig = android.util.Base64.decode(meta.optString("config", ""), android.util.Base64.NO_WRAP)
+                meta.optJSONArray("transform")?.let { tf ->
+                    if (tf.length() == 16) rec.transform = FloatArray(16) { tf.getDouble(it).toFloat() }
+                }
+                rec.frameW = meta.optInt("frameW", 1280)
+                rec.frameH = meta.optInt("frameH", 720)
+                rec.sensorOrientation = meta.optInt("sensorOrientation", 90)
+                rec.extraRotation = meta.optInt("extraRotation", 0)
+            }
+            val z = if (rec.encoded) input else DataInputStream(GZIPInputStream(input, 1 shl 16))
             val clips = meta.optJSONArray("clips") ?: JSONArray()
             for (i in 0 until clips.length()) {
                 val o = clips.getJSONObject(i)
-                val c = Clip(o.optInt("w", rec.sliceW), o.optInt("h", rec.height))
+                val c = Clip(o.optInt("w", rec.sliceW), o.optInt("h", rec.height), o.optDouble("linePos", 0.5).toFloat())
                 val ts = o.getJSONArray("ts")
                 val n = o.optInt("n", ts.length())
+                val sizes = o.optJSONArray("sizes")
+                val keys = o.optJSONArray("keys")
                 for (k in 0 until n) {
                     c.ts.add(ts.getLong(k))
-                    val arr = ByteArray(c.sliceW * c.height * 4)
-                    z.readFully(arr)
-                    c.slices.add(arr)
+                    if (rec.encoded) {
+                        val arr = ByteArray(sizes?.optInt(k, 0) ?: 0)
+                        z.readFully(arr)
+                        c.frames.add(arr)
+                        c.keys.add(keys?.optBoolean(k, false) ?: false)
+                    } else {
+                        val arr = ByteArray(c.sliceW * c.height * 4)
+                        z.readFully(arr)
+                        c.slices.add(arr)
+                    }
                 }
                 rec.clips.add(c)
             }
